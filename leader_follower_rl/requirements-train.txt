@@ -1,0 +1,5 @@
+torch>=2.1
+gymnasium>=0.29
+numpy>=1.24
+tensorboard>=2.15
+onnx>=1.15

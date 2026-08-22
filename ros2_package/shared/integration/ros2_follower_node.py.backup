@@ -1,0 +1,458 @@
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist, PoseStamped
+
+
+# ~/shared viene aggiunto al Python path.
+sys.path.append(
+    os.path.dirname(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
+    )
+)
+
+from inference.policy_runtime import load_policy
+
+
+def wrap_angle(a: float) -> float:
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+class FollowerPolicyNode(Node):
+
+    def __init__(self, policy_path: str):
+        super().__init__("follower_policy_node")
+
+        self.get_logger().info(
+            f"Loading policy: {policy_path}"
+        )
+
+        self.policy = load_policy(policy_path)
+
+        # =========================================================
+        # POSE
+        # =========================================================
+
+        self.leader_pose = None
+        self.follower_pose = None
+
+        # =========================================================
+        # VELOCITÀ
+        # =========================================================
+
+        # Velocità follower:
+        # direttamente dall'odometria del diff_drive_controller.
+        self.follower_v = 0.0
+        self.follower_w = 0.0
+
+        # Velocità leader:
+        # stimate dalla variazione della ground-truth pose.
+        self.leader_v = 0.0
+        self.leader_w = 0.0
+
+        self._previous_leader_pose = None
+        self._previous_leader_time = None
+
+        # =========================================================
+        # SUBSCRIBERS
+        # =========================================================
+
+        self.create_subscription(
+            PoseStamped,
+            "/leader/ground_truth_pose",
+            self._leader_pose_cb,
+            10,
+        )
+
+        self.create_subscription(
+            PoseStamped,
+            "/follower/ground_truth_pose",
+            self._follower_pose_cb,
+            10,
+        )
+
+        self.create_subscription(
+            Odometry,
+            "/follower/diffdrive_controller/odom",
+            self._follower_odom_cb,
+            10,
+        )
+
+        # =========================================================
+        # PUBLISHER
+        # =========================================================
+
+        self.cmd_pub = self.create_publisher(
+            Twist,
+            "/follower/diffdrive_controller/cmd_vel_unstamped",
+            10,
+        )
+
+        # =========================================================
+        # CONTROL LOOP
+        # =========================================================
+
+        # Il training usa dt = 0.1 s -> 10 Hz.
+        self.timer = self.create_timer(
+            0.1,
+            self._control_loop,
+        )
+
+        self.get_logger().info(
+            "Follower policy node started."
+        )
+
+        self.get_logger().info(
+            "Waiting for leader/follower pose and follower odometry..."
+        )
+
+    # =============================================================
+    # POSE
+    # =============================================================
+
+    @staticmethod
+    def _pose_from_posestamped(
+        msg: PoseStamped
+    ) -> np.ndarray:
+
+        q = msg.pose.orientation
+
+        # Estrazione dello yaw direttamente dal quaternion.
+        # Evita tf_transformations/transforms3d.
+        siny_cosp = 2.0 * (
+            q.w * q.z +
+            q.x * q.y
+        )
+
+        cosy_cosp = 1.0 - 2.0 * (
+            q.y * q.y +
+            q.z * q.z
+        )
+
+        theta = np.arctan2(
+            siny_cosp,
+            cosy_cosp,
+        )
+
+        return np.array(
+            [
+                msg.pose.position.x,
+                msg.pose.position.y,
+                theta,
+            ],
+            dtype=np.float64,
+        )
+
+    def _leader_pose_cb(
+        self,
+        msg: PoseStamped
+    ):
+
+        pose = self._pose_from_posestamped(msg)
+
+        # Timestamp ROS -> secondi.
+        stamp = msg.header.stamp
+
+        current_time = (
+            float(stamp.sec) +
+            float(stamp.nanosec) * 1e-9
+        )
+
+        # Prima misura:
+        # non possiamo ancora stimare la velocità.
+        if (
+            self._previous_leader_pose is None
+            or self._previous_leader_time is None
+        ):
+
+            self._previous_leader_pose = pose.copy()
+            self._previous_leader_time = current_time
+
+            self.leader_v = 0.0
+            self.leader_w = 0.0
+
+            self.leader_pose = pose
+
+            return
+
+        dt = (
+            current_time -
+            self._previous_leader_time
+        )
+
+        # Timestamp non valido.
+        if dt <= 1e-6 or dt > 1.0:
+
+            self.leader_v = 0.0
+            self.leader_w = 0.0
+
+            self._previous_leader_pose = pose.copy()
+            self._previous_leader_time = current_time
+
+            self.leader_pose = pose
+
+            return
+
+        previous = self._previous_leader_pose
+
+        dx_world = pose[0] - previous[0]
+        dy_world = pose[1] - previous[1]
+
+        # =========================================================
+        # VELOCITÀ LINEARE LEADER
+        # =========================================================
+
+        theta_previous = previous[2]
+
+        forward_displacement = (
+            dx_world * np.cos(theta_previous)
+            +
+            dy_world * np.sin(theta_previous)
+        )
+
+        self.leader_v = (
+            forward_displacement / dt
+        )
+
+        # =========================================================
+        # VELOCITÀ ANGOLARE LEADER
+        # =========================================================
+
+        dtheta = wrap_angle(
+            pose[2] - previous[2]
+        )
+
+        self.leader_w = dtheta / dt
+
+        # Memorizziamo la misura corrente.
+        self._previous_leader_pose = pose.copy()
+        self._previous_leader_time = current_time
+
+        self.leader_pose = pose
+
+    def _follower_pose_cb(
+        self,
+        msg: PoseStamped
+    ):
+
+        self.follower_pose = (
+            self._pose_from_posestamped(msg)
+        )
+
+    # =============================================================
+    # ODOMETRIA FOLLOWER
+    # =============================================================
+
+    def _follower_odom_cb(
+        self,
+        msg: Odometry
+    ):
+
+        self.follower_v = float(
+            msg.twist.twist.linear.x
+        )
+
+        self.follower_w = float(
+            msg.twist.twist.angular.z
+        )
+
+    # =============================================================
+    # OBSERVATION
+    # =============================================================
+
+    def _build_observation(
+        self
+    ) -> np.ndarray:
+
+        # Posizione relativa leader - follower
+        # nel frame globale.
+        rel = (
+            self.leader_pose[:2]
+            -
+            self.follower_pose[:2]
+        )
+
+        # Trasformazione nel frame del follower.
+        c = np.cos(
+            -self.follower_pose[2]
+        )
+
+        s = np.sin(
+            -self.follower_pose[2]
+        )
+
+        dx = (
+            c * rel[0]
+            -
+            s * rel[1]
+        )
+
+        dy = (
+            s * rel[0]
+            +
+            c * rel[1]
+        )
+
+        # Differenza angolare.
+        dtheta = wrap_angle(
+            self.leader_pose[2]
+            -
+            self.follower_pose[2]
+        )
+
+        # Distanza.
+        dist = float(
+            np.linalg.norm(rel)
+        )
+
+        # Bearing.
+        bearing = float(
+            np.arctan2(dy, dx)
+        )
+
+        # Stessa identica struttura del training.
+        obs = np.array(
+            [
+                dx,
+                dy,
+                dtheta,
+                dist,
+                bearing,
+                self.follower_v,
+                self.follower_w,
+                self.leader_v,
+                self.leader_w,
+            ],
+            dtype=np.float32,
+        )
+
+        return obs
+
+    # =============================================================
+    # CONTROL LOOP
+    # =============================================================
+
+    def _control_loop(self):
+
+        # Aspettiamo di avere entrambe le pose.
+        if (
+            self.leader_pose is None
+            or self.follower_pose is None
+        ):
+            return
+
+        obs = self._build_observation()
+        self.get_logger().info(
+            f"OBS: {np.round(obs, 4)}"
+        )
+        # =========================================================
+        # POLICY
+        # =========================================================
+
+        action = self.policy.act(obs)
+        self.get_logger().info(
+            f"ACTION: {np.round(action, 4)}"
+        )
+
+        action = np.asarray(
+            action,
+            dtype=np.float32,
+        ).reshape(-1)
+
+        if action.shape[0] < 2:
+
+            self.get_logger().error(
+                f"Policy returned invalid action shape: "
+                f"{action.shape}"
+            )
+
+            return
+
+        # =========================================================
+        # LIMITI IDENTICI AL TRAINING
+        # =========================================================
+
+        v = float(
+            np.clip(
+                action[0],
+                0.0,
+                0.6,
+            )
+        )
+
+        w = float(
+            np.clip(
+                action[1],
+                -1.5,
+                1.5,
+            )
+        )
+
+        # =========================================================
+        # COMMAND
+        # =========================================================
+
+        cmd = Twist()
+
+        cmd.linear.x = v
+        cmd.linear.y = 0.0
+        cmd.linear.z = 0.0
+
+        cmd.angular.x = 0.0
+        cmd.angular.y = 0.0
+        cmd.angular.z = w
+
+        self.cmd_pub.publish(cmd)
+
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--policy-path",
+        required=True,
+    )
+
+    args, _ = parser.parse_known_args()
+
+    rclpy.init()
+
+    node = FollowerPolicyNode(
+        args.policy_path
+    )
+
+    try:
+
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        # Comando di stop.
+        stop_cmd = Twist()
+
+        node.cmd_pub.publish(
+            stop_cmd
+        )
+
+        node.destroy_node()
+
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

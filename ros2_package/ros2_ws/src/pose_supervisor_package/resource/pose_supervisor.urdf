@@ -1,0 +1,7 @@
+<?xml version="1.0" ?>
+<robot name="PoseSupervisor">
+  <webots>
+    <plugin type="pose_supervisor_package.pose_supervisor_driver.PoseSupervisorDriver"/>
+  </webots>
+  <link name="base_link"/>
+</robot>

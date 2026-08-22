@@ -1,0 +1,128 @@
+"""
+Nodo ROS2 per il follower. Va eseguito nella VM Linux (dove girano
+ROS2 + webots_ros2, secondo il setup del tutorial Webots/macOS).
+
+Responsabilita' di QUESTO file (e solo queste):
+  1. Leggere la pose (ground-truth, dal Supervisor) di leader e follower
+  2. Leggere le velocita' proprie di ciascun robot dalla sua odometria locale
+     (stima da encoder delle ruote: NON richiede localizzazione globale,
+     esattamente come su un robot vero)
+  3. Costruire il vettore di osservazione ESATTAMENTE come in
+     envs/leader_follower_env.py (stesso ordine, stesse unita' di misura)
+  4. Chiamare policy.act(obs)
+  5. Pubblicare il risultato come Twist su /follower/cmd_vel
+
+Non contiene NESSUNA logica di RL: se domani si cambia algoritmo o si
+riaddestra la policy, questo file non cambia di una riga (finche'
+l'observation space resta lo stesso).
+
+Il source della pose relativa e' intercambiabile: oggi arriva dal
+Supervisor (integration/webots_supervisor_pose_publisher.py, vedi li' il
+perche'), domani potra' arrivare da un sensore vero (telecamera/UWB) che
+pubblica sugli stessi due topic /leader/ground_truth_pose e
+/follower/ground_truth_pose — questo file non cambierebbe.
+
+Uso (dentro la VM, con ROS2 sourcato):
+    python3 integration/ros2_follower_node.py --policy-path policy.onnx
+"""
+from __future__ import annotations
+import argparse
+import os
+import sys
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist, PoseStamped
+from tf_transformations import euler_from_quaternion
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from inference.policy_runtime import load_policy
+
+
+def wrap_angle(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+class FollowerPolicyNode(Node):
+    def __init__(self, policy_path: str):
+        super().__init__("follower_policy_node")
+
+        self.policy = load_policy(policy_path)
+
+        self.leader_pose = None      # np.array([x, y, theta]), frame "map"
+        self.follower_pose = None    # np.array([x, y, theta]), frame "map"
+        self.leader_vel = (0.0, 0.0)     # (v, w) da odometria locale del leader
+        self.follower_vel = (0.0, 0.0)   # (v, w) da odometria locale del follower
+
+        # pose relative (oggi: dal Supervisor; domani: da un sensore vero,
+        # senza dover toccare questo file)
+        self.create_subscription(PoseStamped, "/leader/ground_truth_pose", self._leader_pose_cb, 10)
+        self.create_subscription(PoseStamped, "/follower/ground_truth_pose", self._follower_pose_cb, 10)
+
+        # velocita' proprie: da odometria locale (encoder), non da localizzazione globale
+        self.create_subscription(Odometry, "/leader/odom", self._leader_odom_cb, 10)
+        self.create_subscription(Odometry, "/follower/odom", self._follower_odom_cb, 10)
+
+        self.cmd_pub = self.create_publisher(Twist, "/follower/cmd_vel", 10)
+        self.timer = self.create_timer(0.1, self._control_loop)  # 10 Hz, stesso dt del training
+
+    @staticmethod
+    def _pose_from_posestamped(msg: PoseStamped) -> np.ndarray:
+        q = msg.pose.orientation
+        _, _, theta = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        return np.array([msg.pose.position.x, msg.pose.position.y, theta])
+
+    def _leader_pose_cb(self, msg: PoseStamped):
+        self.leader_pose = self._pose_from_posestamped(msg)
+
+    def _follower_pose_cb(self, msg: PoseStamped):
+        self.follower_pose = self._pose_from_posestamped(msg)
+
+    def _leader_odom_cb(self, msg: Odometry):
+        self.leader_vel = (msg.twist.twist.linear.x, msg.twist.twist.angular.z)
+
+    def _follower_odom_cb(self, msg: Odometry):
+        self.follower_vel = (msg.twist.twist.linear.x, msg.twist.twist.angular.z)
+
+    def _build_observation(self) -> np.ndarray:
+        rel = self.leader_pose[:2] - self.follower_pose[:2]
+        c, s = np.cos(-self.follower_pose[2]), np.sin(-self.follower_pose[2])
+        dx = c * rel[0] - s * rel[1]
+        dy = s * rel[0] + c * rel[1]
+        dtheta = wrap_angle(self.leader_pose[2] - self.follower_pose[2])
+        dist = float(np.linalg.norm(rel))
+        bearing = float(np.arctan2(dy, dx))
+        v_f, w_f = self.follower_vel
+        v_l, w_l = self.leader_vel
+        return np.array([dx, dy, dtheta, dist, bearing, v_f, w_f, v_l, w_l], dtype=np.float32)
+
+    def _control_loop(self):
+        if self.leader_pose is None or self.follower_pose is None:
+            return  # non ho ancora ricevuto entrambe le pose dal Supervisor
+
+        obs = self._build_observation()
+        action = self.policy.act(obs)
+
+        cmd = Twist()
+        cmd.linear.x = float(action[0])
+        cmd.angular.z = float(action[1])
+        self.cmd_pub.publish(cmd)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--policy-path", required=True)
+    args, _ = parser.parse_known_args()
+
+    rclpy.init()
+    node = FollowerPolicyNode(args.policy_path)
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
